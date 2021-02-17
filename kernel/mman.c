@@ -18,14 +18,14 @@
 **
 ** The memory space has the following layout.
 **
-**     <---VADs---><---BREAK---><--UNASSIGNED--><---------MAPPED---------->
+**     <--BITMAP--><---BREAK---><--UNASSIGNED--><---------MAPPED---------->
 **     [..................................................................]
 **     ^           ^            ^               ^                         ^
 **    BASE       START         BRK             MAP                       END
 **
 ** The memory space is partitioned into four sections:
 **
-**     VADs       - VADs or virtual address descriptors: (BASE, START)
+**     BITMAP     - bitmap of used nodes
 **     BREAK      - Managed by the BRK and SBRK: [START, BRK)
 **     UNASSIGNED - Unassigned memory: [BRK, MAP)
 **     MAPPED     - Manged by the MAP, REMAP, and UNMAP: [MAP, END)
@@ -33,7 +33,7 @@
 ** The following diagram depicts the values of BASE, START, BRK, MAP, and
 ** END for a freshly initialized memory space.
 **
-**     <---VADs---><---------------UNASSIGNED----------------------------->
+**     <--BITMAP--><---------------UNASSIGNED----------------------------->
 **     [..................................................................]
 **     ^           ^                                                      ^
 **    BASE       START                                                   END
@@ -43,70 +43,6 @@
 ** The BREAK section expands by increasing the BRK value. The MAPPED section
 ** expands by decreasing the MAP value. The BRK and MAP value grow towards
 ** one another until all unassigned memory is exhausted.
-**
-** A VAD (virtual address descriptor) is a structure that defines a memory
-** region obtained with the MMAP or MREMAP operations. A VAD keeps track
-** of the following information about a memory region.
-**
-**     - The next VAD on the linked list (see description below).
-**     - The previous VAD on the linked list (see description below).
-**     - The starting address of the memory region.
-**     - The size of the memory region.
-**     - Memory projection flags (must be read-write for SGX1).
-**     - Memory mapping flags (must be anonymous-private for SGX1).
-**
-** VADs are either assigned or free. Assigned VADs are kept on a doubly-linked
-** list, sorted by starting address. When VADs are freed (by the UNMAP
-** operation), they are inserted to the singly-linked VAD free list.
-**
-** PERFORMANCE:
-** ============
-**
-** The current implementation organizes VADs onto a simple linear linked list.
-** The time complexities of the related operations (MAP, REMAP, and UNMAP) are
-** all O(N), where N is the number of VADs in the linked list.
-**
-** In the worst case, N is the maximum number of pages, where a memory region
-** is assigned for every available page. For a 128 MB memory space, N is less
-** than 32,768.
-**
-** The MUSL memory allocator (malloc, realloc, calloc, free) uses both
-**
-**     - BREAK memory -- for allocations less than 56 pages
-**     - MAPPED memory -- for allocates greater or equal to 57 pages
-**
-** In this context, the time complexities of the mapping operations fall to
-** O(M), where M is:
-**
-**     NUM_PAGES = 32,768 pages
-**     SMALLEST_ALLOCATION = 57 pages
-**     M = NUM_PAGES / SMALLEST_ALLOCATION
-**     M = 574
-**
-** M will even be smaller when the VADs and BREAK regions are subtracted from
-** NUM_PAGES. A rough estimates puts the time complexity for the mapping
-** operations at about O(M), where M == 400.
-**
-** OPTIMIZATION:
-** =============
-**
-** To optimize performance, one might consider organizing the active VADs into
-** a balanced binary tree variant (AVL or red-black). Two operations must be
-** accounted for.
-**
-**     - Address lookup -- lookup the VAD that contains the given address
-**     - Gap lookup -- find a gap greater than a given size
-**
-** For address lookup a simple AVL tree will suffice such that the key is the
-** starting address of the VAD. The lookup function should check to see if the
-** address falls within the address range given by the VAD. Address lookup will
-** be O(log 2 N).
-**
-** Gap lookup is more complicated. The AVL tree could be extended so that each
-** node in the tree (that is each VAD) contains the maximum gap size of the
-** subtree for which it is a root. The lookup function simply looks for any
-** gap that is large enough. An alternative is to look for the best fit, but
-** this is not strictly necessary. Gap lookup will be O(log 2 N).
 **
 **==============================================================================
 */
@@ -121,153 +57,6 @@
 #include <myst/round.h>
 #include <myst/spinlock.h>
 #include <myst/strings.h>
-
-/*
-**==============================================================================
-**
-** Local utility functions:
-**
-**==============================================================================
-*/
-
-/* Get the end address of a VAD */
-static uintptr_t _end(myst_vad_t* vad)
-{
-    return vad->addr + vad->size;
-}
-
-/* Get the size of the gap to the right of this VAD */
-static size_t _get_right_gap(myst_mman_t* mman, myst_vad_t* vad)
-{
-    if (vad->next)
-    {
-        /* Get size of gap between this VAD and next one */
-        return vad->next->addr - _end(vad);
-    }
-    else
-    {
-        /* Get size of gap between this VAD and the end of the heap */
-        return mman->end - _end(vad);
-    }
-}
-
-/*
-**==============================================================================
-**
-** _FreeList functions
-**
-**==============================================================================
-*/
-
-/* Get a VAD from the free list */
-static myst_vad_t* _free_list_get(myst_mman_t* mman)
-{
-    myst_vad_t* vad = NULL;
-
-    /* First try the free list */
-    if (mman->free_vads)
-    {
-        vad = mman->free_vads;
-        mman->free_vads = vad->next;
-        goto done;
-    }
-
-    /* Now try the myst_vad_t array */
-    if (mman->next_vad != mman->end_vad)
-    {
-        vad = mman->next_vad++;
-        goto done;
-    }
-
-done:
-    return vad;
-}
-
-/* Return a free myst_vad_t to the free list */
-static void _free_list_put(myst_mman_t* mman, myst_vad_t* vad)
-{
-    /* Clear the VAD */
-    vad->addr = 0;
-    vad->size = 0;
-    vad->prot = 0;
-    vad->flags = 0;
-
-    /* Insert into singly-linked free list as first element */
-    vad->next = mman->free_vads;
-    mman->free_vads = vad;
-}
-
-/*
-**==============================================================================
-**
-** _List functions
-**
-**==============================================================================
-*/
-
-/* Insert VAD after PREV in the linked list */
-static void _list_insert_after(
-    myst_mman_t* mman,
-    myst_vad_t* prev,
-    myst_vad_t* vad)
-{
-    if (prev)
-    {
-        vad->prev = prev;
-        vad->next = prev->next;
-
-        if (prev->next)
-            prev->next->prev = vad;
-
-        prev->next = vad;
-    }
-    else
-    {
-        vad->prev = NULL;
-        vad->next = mman->vad_list;
-
-        if (mman->vad_list)
-            mman->vad_list->prev = vad;
-
-        mman->vad_list = vad;
-    }
-}
-
-/* Remove VAD from the doubly-linked list */
-static void _list_remove(myst_mman_t* mman, myst_vad_t* vad)
-{
-    /* Remove from doubly-linked list */
-    if (vad == mman->vad_list)
-    {
-        mman->vad_list = vad->next;
-
-        if (vad->next)
-            vad->next->prev = NULL;
-    }
-    else
-    {
-        if (vad->prev)
-            vad->prev->next = vad->next;
-
-        if (vad->next)
-            vad->next->prev = vad->prev;
-    }
-}
-
-/* Find a VAD that contains the given address */
-static myst_vad_t* _list_find(myst_mman_t* mman, uintptr_t addr)
-{
-    myst_vad_t* p;
-
-    for (p = mman->vad_list; p; p = p->next)
-    {
-        if (addr >= p->addr && addr < _end(p))
-            return p;
-    }
-
-    /* Not found */
-    return NULL;
-}
 
 /*
 **==============================================================================
@@ -317,119 +106,83 @@ static bool _mman_is_sane(myst_mman_t* mman)
     return true;
 }
 
-/* Allocate and initialize a new VAD */
-static myst_vad_t* _mman_new_vad(
-    myst_mman_t* mman,
-    uintptr_t addr,
-    size_t size,
-    int prot,
-    int flags)
+MYST_INLINE bool _test_bit(const uint8_t* data, uint32_t index)
 {
-    myst_vad_t* vad = NULL;
-
-    if (!(vad = _free_list_get(mman)))
-        goto done;
-
-    vad->addr = addr;
-    vad->size = (uint32_t)size;
-    vad->prot = (uint16_t)prot;
-    vad->flags = (uint16_t)flags;
-
-done:
-    return vad;
+    uint32_t byte = index / 8;
+    uint32_t bit = index % 8;
+    return ((uint32_t)(data[byte]) & (1 << bit)) ? 1 : 0;
 }
 
-/* Synchronize the MAP value to the address of the first list element */
-static void _mman_sync_top(myst_mman_t* mman)
+MYST_INLINE void _set_bit(uint8_t* data, uint32_t index)
 {
-    if (mman->vad_list)
-        mman->map = mman->vad_list->addr;
-    else
-        mman->map = mman->end;
+    uint32_t byte = index / 8;
+    uint32_t bit = index % 8;
+    data[byte] |= (1 << bit);
 }
 
-/*
-** Search for a gap (greater than or equal to SIZE) in the VAD list. Set
-** LEFT to the leftward neighboring VAD (if any). Set RIGHT to the rightward
-** neighboring VAD (if any). Return a pointer to the start of that gap.
-**
-**                     +----+  +--------+
-**                     |    |  |        |
-**                     |    v  |        v
-**     [........MMMMMMMM....MMMM........MMMMMMMMMMMM........]
-**              ^                       ^                   ^
-**             HEAD                    TAIL                END
-**              ^
-**             MAP
-**
-** Search for gaps in the following order:
-**     (1) Between HEAD and TAIL
-**     (2) Between TAIL and END
-**
-** Note: one of the following conditions always holds:
-**     (1) MAP == HEAD
-**     (2) MAP == END
-**
-*/
-static uintptr_t _mman_find_gap(
-    myst_mman_t* mman,
-    size_t size,
-    myst_vad_t** left,
-    myst_vad_t** right)
+MYST_INLINE void _clear_bit(uint8_t* data, uint32_t index)
 {
-    uintptr_t addr = 0;
+    uint32_t byte = index / 8;
+    uint32_t bit = index % 8;
+    data[byte] &= ~(1 << bit);
+}
 
-    *left = NULL;
-    *right = NULL;
+/* find a run of zero bits that is npages or longer */
+static ssize_t _find_free_bits(myst_mman_t* mman, size_t nbits)
+{
+    ssize_t ret = -1;
+    size_t n = 0;
+    size_t m = mman->bitmap_size * 8;
 
-    if (!_mman_is_sane(mman))
-        goto done;
-
-    /* Look for a gap in the VAD list */
+    for (size_t i = 0; i < m; i++)
     {
-        myst_vad_t* p;
-
-        /* Search for gaps between HEAD and TAIL */
-        for (p = mman->vad_list; p; p = p->next)
+        /* optimization: skip full bytes */
+        if (mman->bitmap[i / 8] == 0xff)
         {
-            size_t gap = _get_right_gap(mman, p);
+            i += 8;
+            n = 0;
+            continue;
+        }
 
-            if (gap >= size)
-            {
-                *left = p;
-                *right = p->next;
+        if (_test_bit(mman->bitmap, i))
+            n = 0;
+        else
+            n++;
 
-                addr = _end(p);
-                goto done;
-            }
+        if (n == nbits)
+        {
+            ret = i - n;
+            break;
         }
     }
 
-    /* No gaps in linked list so obtain memory from mapped memory area */
-    {
-        uintptr_t start = mman->map - size;
+    return ret;
+}
 
-        /* If memory was exceeded (overrun of break value) */
-        if (!(mman->brk <= start))
-        {
-            goto done;
-        }
+static uintptr_t _index_to_ptr(myst_mman_t* mman, size_t index)
+{
+    uintptr_t ptr = mman->end - (index * PAGE_SIZE) - PAGE_SIZE;
 
-        if (mman->vad_list)
-            *right = mman->vad_list;
+    if (ptr < mman->brk)
+        return 0;
 
-        addr = start;
-        goto done;
-    }
+    return ptr;
+}
 
-done:
-    return addr;
+static ssize_t _ptr_to_index(myst_mman_t* mman, uintptr_t ptr)
+{
+    if (!(ptr >= mman->map && ptr < mman->end))
+        return -1;
+
+    const ptrdiff_t delta = mman->end - ptr;
+
+    return delta / PAGE_SIZE;
 }
 
 static int _munmap(myst_mman_t* mman, void* addr, size_t length)
 {
     int ret = -1;
-    myst_vad_t* vad = NULL;
+    myst_mnode_t* mnode = NULL;
 
     _mman_clear_err(mman);
 
@@ -470,21 +223,26 @@ static int _munmap(myst_mman_t* mman, void* addr, size_t length)
     /* Set start and end pointers for this area */
     uintptr_t start = (uintptr_t)addr;
     uintptr_t end = (uintptr_t)addr + length;
+    size_t nbits = (end - start) / PAGE_SIZE;
+    size_t index;
 
-    /* Find the VAD that contains this address */
-    if (!(vad = _list_find(mman, start)))
+    /* convert the pointer to a page index */
+    if ((index = _ptr_to_index(mman, start)) < 0)
     {
-        _mman_set_err(mman, "address not found");
+        _mman_set_err(mman, "munmap: bad addr parameter");
         ret = -EINVAL;
         goto done;
     }
 
-    /* Fail if this VAD does not contain the end address */
-    if (end > _end(vad))
+    /* verify that all bits in this range are set */
+    for (size_t i = index; i < nbits; i++)
     {
-        _mman_set_err(mman, "illegal range");
-        ret = -EINVAL;
-        goto done;
+        if (!_test_bit(mman->bitmap, i))
+        {
+            _mman_set_err(mman, "munmap: invalid address range");
+            ret = -EINVAL;
+            goto done;
+        }
     }
 
     /* If the unapping does not cover the entire area given by the VAD, handle
@@ -531,7 +289,7 @@ static int _munmap(myst_mman_t* mman, void* addr, size_t length)
 
         /* Create VAD for the excess right portion */
         if (!(right = _mman_new_vad(
-                  mman, end, vad_end - end, vad->prot, vad->flags)))
+                  mman, end, vad_end - end, vad->__prot, vad->__flags)))
         {
             _mman_set_err(mman, "out of VADs");
             ret = -EINVAL;
@@ -601,6 +359,8 @@ static int _mmap(
         goto done;
     }
 
+    (void)prot;
+
     /* Ignore protection for SGX-1 */
 #if 0
     {
@@ -668,19 +428,27 @@ static int _mmap(
 
     if (addr)
     {
-        myst_vad_t* vad;
         uintptr_t start = (uintptr_t)addr;
         uintptr_t end = (uintptr_t)addr + length;
+        size_t nbits = (end - start) / PAGE_SIZE;
+        size_t index;
 
-        /* Fail if [addr:length] is not already mapped */
-        if (!(vad = _list_find(mman, start)) || end > _end(vad))
+        if ((index = _ptr_to_index(mman, start)) < 0)
         {
-            _mman_set_err(
-                mman,
-                "bad addr parameter: "
-                "must be null or part of an existing mapping");
+            _mman_set_err(mman, "bad mmap addr parameter");
             ret = -EINVAL;
             goto done;
+        }
+
+        /* verify that all bits in this range are set */
+        for (size_t i = index; i < nbits; i++)
+        {
+            if (!_test_bit(mman->bitmap, i))
+            {
+                _mman_set_err(mman, "bad mmap addr parameter");
+                ret = -EINVAL;
+                goto done;
+            }
         }
 
         *ptr_out = addr;
@@ -688,59 +456,34 @@ static int _mmap(
     }
     else
     {
-        myst_vad_t* left;
-        myst_vad_t* right;
+        /* length is a multiple of the page size */
+        const size_t npages = length / PAGE_SIZE;
+        ssize_t index;
 
-        /* Find a gap that is big enough */
-        if (!(start = _mman_find_gap(mman, length, &left, &right)))
+        /* find a run of zero bits that is long enough */
+        if ((index = _find_free_bits(mman, npages)) < 0)
         {
             _mman_set_err(mman, "out of memory");
             ret = -ENOMEM;
             goto done;
         }
 
-        if (left && _end(left) == start)
+        /* Get the pointer from the index */
+        if ((start = _index_to_ptr(mman, index)) == 0)
         {
-            /* Coalesce with LEFT neighbor */
-
-            left->size += (uint32_t)length;
-
-            /* Coalesce with RIGHT neighbor (and release right neighbor) */
-            if (right && (start + length == right->addr))
-            {
-                _list_remove(mman, right);
-                left->size += right->size;
-                _free_list_put(mman, right);
-            }
+            _mman_set_err(mman, "out of memory");
+            ret = -ENOMEM;
+            goto done;
         }
-        else if (right && (start + length == right->addr))
-        {
-            /* Coalesce with RIGHT neighbor */
 
-            right->addr = start;
-            right->size += (uint32_t)length;
-            _mman_sync_top(mman);
-        }
-        else
-        {
-            myst_vad_t* vad;
+        /* Adjust mman->mmap */
+        if (start < mman->map)
+            mman->map = start;
 
-            /* Create a new VAD and insert it into the list */
-
-            if (!(vad = _mman_new_vad(mman, start, length, prot, flags)))
-            {
-                _mman_set_err(mman, "unexpected: list insert failed");
-                ret = -EINVAL;
-                goto done;
-            }
-
-            _list_insert_after(mman, left, vad);
-            _mman_sync_top(mman);
-        }
+        /* reserve the bits */
+        for (size_t i = index; i < npages; i++)
+            _set_bit(mman->bitmap, i);
     }
-
-    if (!_mman_is_sane(mman))
-        goto done;
 
     *ptr_out = (void*)start;
 
@@ -752,6 +495,8 @@ done:
 
     return ret;
 }
+
+#if 0
 
 /*
 **==============================================================================
@@ -1232,8 +977,8 @@ int myst_mman_mremap(
                       mman,
                       old_end,
                       _end(vad) - old_end,
-                      vad->prot,
-                      vad->flags)))
+                      vad->__prot,
+                      vad->__flags)))
             {
                 _mman_set_err(mman, "out of VADs");
                 ret = -ENOMEM;
@@ -1275,7 +1020,7 @@ int myst_mman_mremap(
         }
         else
         {
-            if (_mmap(mman, NULL, new_size, vad->prot, vad->flags, &addr) != 0)
+            if (_mmap(mman, NULL, new_size, vad->__prot, vad->__flags, &addr) != 0)
             {
                 _mman_set_err(mman, "mapping failed");
                 ret = -ENOMEM;
@@ -1530,3 +1275,5 @@ void myst_mman_dump_vads(myst_mman_t* mman)
     }
     myst_spin_unlock(&mman->lock);
 }
+
+#endif

@@ -23,33 +23,11 @@
 
 #define MYST_MMAN_ERROR_SIZE 256
 
-/* Virtual Address Descriptor */
-typedef struct myst_vad
-{
-    /* Pointer to next myst_vad_t on linked list */
-    struct myst_vad* next;
-
-    /* Pointer to previous myst_vad_t on linked list */
-    struct myst_vad* prev;
-
-    /* Address of this memory region */
-    uintptr_t addr;
-
-    /* Size of this memory region in bytes */
-    uint32_t size;
-
-    /* Protection flags for this region MYST_PROT_???? */
-    uint16_t prot;
-
-    /* Mapping flags for this region: MYST_MAP_???? */
-    uint16_t flags;
-} myst_vad_t;
-
-_Static_assert(sizeof(myst_vad_t) == 32, "");
-
 #define MYST_MMAN_MAGIC 0xcc8e1732ebd80b0b
 
 #define MYST_MMAN_ERR_SIZE 256
+
+typedef struct myst_mnode myst_mnode_t;
 
 /* myst_mman_t data structures and fields */
 typedef struct myst_mman
@@ -66,7 +44,7 @@ typedef struct myst_mman
     /* Size of heap (a multiple of MYST_PAGE_SIZE) */
     size_t size;
 
-    /* Start of heap (immediately aft4er VADs array) */
+    /* Start of heap (immediately after VADs array) */
     uintptr_t start;
 
     /* End of heap (points to first page after end of heap) */
@@ -78,17 +56,9 @@ typedef struct myst_mman
     /* Current map value: top of mapped memory partition (grows negatively) */
     uintptr_t map;
 
-    /* The next available myst_vad_t in the VADs array */
-    myst_vad_t* next_vad;
-
-    /* The end of the VADs array */
-    myst_vad_t* end_vad;
-
-    /* The myst_vad_t free list (singly linked) */
-    myst_vad_t* free_vads;
-
-    /* Linked list of VADs (sorted by address and doubly linked) */
-    myst_vad_t* vad_list;
+    /* the page bitmap */
+    uint8_t* bitmap;
+    size_t bitmap_size; /* bitmap size in bytes */
 
     /* Whether sanity checks are enabled: see MYST_HeapEnableSanityChecks() */
     bool sanity;
